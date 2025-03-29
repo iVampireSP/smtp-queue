@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/smtp"
+	"strings"
 	"time"
 
 	"github.com/ivampiresp/smtp-queue/config"
@@ -138,27 +139,87 @@ func (w *Worker) sendEmail(email *db.Email) error {
 	smtpAddr := fmt.Sprintf("%s:%d", w.config.SMTPHost, w.config.SMTPPort)
 	auth := smtp.PlainAuth("", w.config.SMTPUsername, w.config.SMTPPassword, w.config.SMTPHost)
 
-	// 准备邮件头
+	// 准备邮件发送信息
 	from := email.From
 	if w.config.SMTPFrom != "" {
 		from = w.config.SMTPFrom
 	}
 
-	// 构造邮件内容
-	header := make(map[string]string)
-	header["From"] = from
-	header["To"] = buildAddressList(email.To)
-	header["Subject"] = email.Subject
-	header["MIME-Version"] = "1.0"
-	header["Content-Type"] = "text/plain; charset=\"utf-8\""
-	header["Content-Transfer-Encoding"] = "8bit"
-	header["Date"] = time.Now().Format(time.RFC1123Z)
-
-	var message string
-	for k, v := range header {
-		message += fmt.Sprintf("%s: %s\r\n", k, v)
+	// 检查邮件内容是否已包含邮件头
+	hasHeaders := false
+	lines := strings.Split(email.Body, "\r\n")
+	if len(lines) == 0 {
+		lines = strings.Split(email.Body, "\n") // 兼容以\n分隔的情况
 	}
-	message += "\r\n" + email.Body
+
+	// 检查是否存在常见的邮件头
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "content-type:") ||
+			strings.HasPrefix(strings.ToLower(line), "mime-version:") {
+			hasHeaders = true
+			break
+		}
+	}
+
+	// 准备邮件内容
+	var message string
+	if hasHeaders {
+		// 邮件内容已经包含头部，检查是否有必要的头部
+		hasFrom := false
+		hasTo := false
+		hasSubject := false
+		hasDate := false
+
+		for _, line := range lines {
+			lowerLine := strings.ToLower(line)
+			if strings.HasPrefix(lowerLine, "from:") {
+				hasFrom = true
+			} else if strings.HasPrefix(lowerLine, "to:") {
+				hasTo = true
+			} else if strings.HasPrefix(lowerLine, "subject:") {
+				hasSubject = true
+			} else if strings.HasPrefix(lowerLine, "date:") {
+				hasDate = true
+			}
+		}
+
+		// 添加缺失的必要头部
+		var headers []string
+		if !hasFrom {
+			headers = append(headers, fmt.Sprintf("From: %s", from))
+		}
+		if !hasTo {
+			headers = append(headers, fmt.Sprintf("To: %s", buildAddressList(email.To)))
+		}
+		if !hasSubject {
+			headers = append(headers, fmt.Sprintf("Subject: %s", email.Subject))
+		}
+		if !hasDate {
+			headers = append(headers, fmt.Sprintf("Date: %s", time.Now().Format(time.RFC1123Z)))
+		}
+
+		if len(headers) > 0 {
+			message = strings.Join(headers, "\r\n") + "\r\n" + email.Body
+		} else {
+			message = email.Body
+		}
+	} else {
+		// 构建完整的邮件，包括头部
+		header := make(map[string]string)
+		header["From"] = from
+		header["To"] = buildAddressList(email.To)
+		header["Subject"] = email.Subject
+		header["MIME-Version"] = "1.0"
+		header["Content-Type"] = "text/plain; charset=\"utf-8\""
+		header["Content-Transfer-Encoding"] = "8bit"
+		header["Date"] = time.Now().Format(time.RFC1123Z)
+
+		message = ""
+		for k, v := range header {
+			message += fmt.Sprintf("%s: %s\r\n", k, v)
+		}
+		message += "\r\n" + email.Body
+	}
 
 	// 根据加密方式发送邮件
 	switch w.config.SMTPEncryption {

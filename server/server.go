@@ -301,23 +301,12 @@ func (s *smtpSession) processEmail() error {
 		return errors.New("邮件内容为空")
 	}
 
-	// 解析邮件头和正文
+	// 解析邮件内容以获取主题（用于日志记录）
 	var subject string
-	var body []string
-	var inHeader = true
-
 	for _, line := range s.data {
-		if inHeader {
-			if line == "" {
-				inHeader = false
-				continue
-			}
-
-			if strings.HasPrefix(strings.ToLower(line), "subject:") {
-				subject = strings.TrimSpace(line[8:])
-			}
-		} else {
-			body = append(body, line)
+		if strings.HasPrefix(strings.ToLower(line), "subject:") {
+			subject = strings.TrimSpace(line[8:])
+			break
 		}
 	}
 
@@ -326,13 +315,16 @@ func (s *smtpSession) processEmail() error {
 		subject = "(无主题)"
 	}
 
-	// 将邮件添加到队列
+	// 将邮件添加到队列，保留完整的原始内容
 	from := s.mailFrom
 	if s.cfg.SMTPFrom != "" {
 		from = s.cfg.SMTPFrom
 	}
 
-	_, err := s.db.QueueEmail(from, s.rcptTo, subject, strings.Join(body, "\n"))
+	// 保留原始邮件内容，包括所有邮件头和正文
+	originalContent := strings.Join(s.data, "\r\n")
+
+	_, err := s.db.QueueEmail(from, s.rcptTo, subject, originalContent)
 	if err != nil {
 		return fmt.Errorf("将邮件添加到队列时出错: %w", err)
 	}
