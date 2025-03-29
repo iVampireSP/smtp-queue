@@ -315,16 +315,20 @@ func (s *smtpSession) processEmail() error {
 		subject = "(无主题)"
 	}
 
-	// 将邮件添加到队列，保留完整的原始内容
-	from := s.mailFrom
-	if s.cfg.SMTPFrom != "" {
-		from = s.cfg.SMTPFrom
+	// 客户端提供的发件人仅用于记录，SMTP发送时将使用配置的SMTP_FROM
+	clientFrom := s.mailFrom
+
+	// 确保有配置的SMTP_FROM
+	if s.cfg.SMTPFrom == "" {
+		log.Warn().Str("client_from", clientFrom).Msg("未配置SMTP_FROM，邮件可能无法发送")
+	} else {
+		log.Info().Str("client_from", clientFrom).Str("actual_from", s.cfg.SMTPFrom).Msg("使用配置的发件人替代客户端发件人")
 	}
 
 	// 保留原始邮件内容，包括所有邮件头和正文
 	originalContent := strings.Join(s.data, "\r\n")
 
-	_, err := s.db.QueueEmail(from, s.rcptTo, subject, originalContent)
+	_, err := s.db.QueueEmail(clientFrom, s.rcptTo, subject, originalContent)
 	if err != nil {
 		return fmt.Errorf("将邮件添加到队列时出错: %w", err)
 	}

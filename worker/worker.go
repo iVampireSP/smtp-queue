@@ -139,10 +139,10 @@ func (w *Worker) sendEmail(email *db.Email) error {
 	smtpAddr := fmt.Sprintf("%s:%d", w.config.SMTPHost, w.config.SMTPPort)
 	auth := smtp.PlainAuth("", w.config.SMTPUsername, w.config.SMTPPassword, w.config.SMTPHost)
 
-	// 准备邮件发送信息
-	from := email.From
-	if w.config.SMTPFrom != "" {
-		from = w.config.SMTPFrom
+	// 始终使用配置的SMTP_FROM作为发件人，忽略客户端提供的发件人
+	from := w.config.SMTPFrom
+	if from == "" {
+		return fmt.Errorf("未配置SMTP_FROM，无法发送邮件")
 	}
 
 	// 检查邮件内容是否已包含邮件头
@@ -164,45 +164,78 @@ func (w *Worker) sendEmail(email *db.Email) error {
 	// 准备邮件内容
 	var message string
 	if hasHeaders {
-		// 邮件内容已经包含头部，检查是否有必要的头部
-		hasFrom := false
-		hasTo := false
-		hasSubject := false
-		hasDate := false
+		// 邮件内容已经包含头部，我们需要替换或添加From头部
+		var newLines []string
+		fromReplaced := false
+		toReplaced := false
 
+		// 替换或添加必要的头部
 		for _, line := range lines {
 			lowerLine := strings.ToLower(line)
+
+			// 替换From头
 			if strings.HasPrefix(lowerLine, "from:") {
-				hasFrom = true
-			} else if strings.HasPrefix(lowerLine, "to:") {
-				hasTo = true
-			} else if strings.HasPrefix(lowerLine, "subject:") {
-				hasSubject = true
-			} else if strings.HasPrefix(lowerLine, "date:") {
-				hasDate = true
+				newLines = append(newLines, fmt.Sprintf("From: %s", from))
+				fromReplaced = true
+				continue
 			}
+
+			// 替换To头
+			if strings.HasPrefix(lowerLine, "to:") {
+				newLines = append(newLines, fmt.Sprintf("To: %s", buildAddressList(email.To)))
+				toReplaced = true
+				continue
+			}
+
+			// 保留其他头部和内容
+			newLines = append(newLines, line)
 		}
 
-		// 添加缺失的必要头部
-		var headers []string
-		if !hasFrom {
-			headers = append(headers, fmt.Sprintf("From: %s", from))
-		}
-		if !hasTo {
-			headers = append(headers, fmt.Sprintf("To: %s", buildAddressList(email.To)))
-		}
-		if !hasSubject {
-			headers = append(headers, fmt.Sprintf("Subject: %s", email.Subject))
-		}
-		if !hasDate {
-			headers = append(headers, fmt.Sprintf("Date: %s", time.Now().Format(time.RFC1123Z)))
+		// 如果没有替换From头，添加一个
+		if !fromReplaced {
+			// 找到第一个空行前插入From头
+			inserted := false
+			newLinesWithFrom := []string{}
+
+			for _, line := range newLines {
+				if line == "" && !inserted {
+					newLinesWithFrom = append(newLinesWithFrom, fmt.Sprintf("From: %s", from))
+					inserted = true
+				}
+				newLinesWithFrom = append(newLinesWithFrom, line)
+			}
+
+			// 如果没有空行，在开头添加From头
+			if !inserted {
+				newLinesWithFrom = append([]string{fmt.Sprintf("From: %s", from)}, newLines...)
+			}
+
+			newLines = newLinesWithFrom
 		}
 
-		if len(headers) > 0 {
-			message = strings.Join(headers, "\r\n") + "\r\n" + email.Body
-		} else {
-			message = email.Body
+		// 如果没有替换To头，添加一个
+		if !toReplaced {
+			// 找到第一个空行前插入To头
+			inserted := false
+			newLinesWith := []string{}
+
+			for _, line := range newLines {
+				if line == "" && !inserted {
+					newLinesWith = append(newLinesWith, fmt.Sprintf("To: %s", buildAddressList(email.To)))
+					inserted = true
+				}
+				newLinesWith = append(newLinesWith, line)
+			}
+
+			// 如果没有空行，在开头添加To头
+			if !inserted {
+				newLinesWith = append([]string{fmt.Sprintf("To: %s", buildAddressList(email.To))}, newLines...)
+			}
+
+			newLines = newLinesWith
 		}
+
+		message = strings.Join(newLines, "\r\n")
 	} else {
 		// 构建完整的邮件，包括头部
 		header := make(map[string]string)
