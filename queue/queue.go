@@ -24,7 +24,10 @@ type Queue struct {
 func New(cfg *config.RedisConfig, maxAge time.Duration, maxFail int) (*Queue, error) {
 	var client redis.UniversalClient
 
-	if cfg.MasterName != "" {
+	mode := strings.ToLower(cfg.Mode)
+
+	switch {
+	case mode == "sentinel" || (mode == "" && cfg.MasterName != ""):
 		// Sentinel 模式
 		client = redis.NewFailoverClient(&redis.FailoverOptions{
 			MasterName:    cfg.MasterName,
@@ -32,7 +35,7 @@ func New(cfg *config.RedisConfig, maxAge time.Duration, maxFail int) (*Queue, er
 			Password:      cfg.Password,
 			DB:            cfg.DB,
 		})
-	} else if len(cfg.Addrs) > 1 {
+	case mode == "cluster" || (mode == "" && len(cfg.Addrs) > 1):
 		// Cluster 模式
 		if cfg.DB != 0 {
 			log.Warn().Int("db", cfg.DB).Msg("Redis Cluster 不支持多数据库，忽略 db 配置")
@@ -41,7 +44,7 @@ func New(cfg *config.RedisConfig, maxAge time.Duration, maxFail int) (*Queue, er
 			Addrs:    cfg.Addrs,
 			Password: cfg.Password,
 		})
-	} else {
+	default:
 		// 单节点模式
 		client = redis.NewClient(&redis.Options{
 			Addr:     cfg.Addrs[0],

@@ -18,6 +18,7 @@ data:
     redis:
       addrs:
         - "redis.database-system.svc:6379"
+      mode: "cluster"
       password: "<REDIS_PASSWORD>"
       db: 0
       key_prefix: "mail-relay:"

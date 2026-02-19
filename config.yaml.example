@@ -10,6 +10,7 @@ redis:
   addrs:
     - "localhost:6379"
   # master_name: "mymaster"    # Sentinel 模式
+  # mode: "cluster"            # standalone / cluster / sentinel（留空自动判断）
   password: ""
   db: 0
   key_prefix: "smtp-queue:"

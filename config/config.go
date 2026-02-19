@@ -34,6 +34,7 @@ type RedisConfig struct {
 	Password   string   `yaml:"password"`
 	DB         int      `yaml:"db"`
 	KeyPrefix  string   `yaml:"key_prefix"`
+	Mode       string   `yaml:"mode"` // standalone, cluster, sentinel（留空则自动判断）
 }
 
 // SMTPServer 出站 SMTP 服务器配置
