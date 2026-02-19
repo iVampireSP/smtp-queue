@@ -130,7 +130,7 @@ func (s *Server) Stop() error {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	log.Info().Str("client", conn.RemoteAddr().String()).Msg("客户端连接")
+	client := conn.RemoteAddr().String()
 
 	// 创建会话
 	session := newSession(conn, s.Queue, s.Config)
@@ -142,8 +142,15 @@ func (s *Server) handleConnection(conn net.Conn) {
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20) // 最大行 1MB（base64 附件）
 
+	hasCommand := false
 	conn.SetDeadline(time.Now().Add(idleTimeout))
 	for scanner.Scan() {
+		// 首条命令时记录连接（过滤健康检查等无交互连接）
+		if !hasCommand {
+			hasCommand = true
+			log.Info().Str("client", client).Msg("客户端连接")
+		}
+
 		// 每次收到数据后重置空闲超时
 		conn.SetDeadline(time.Now().Add(idleTimeout))
 
@@ -161,7 +168,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		log.Error().Err(err).Msg("读取客户端数据时出错")
 	}
 
-	log.Info().Str("client", conn.RemoteAddr().String()).Msg("客户端断开连接")
+	if hasCommand {
+		log.Info().Str("client", client).Msg("客户端断开连接")
+	}
 }
 
 // smtpSession 表示一个SMTP会话
