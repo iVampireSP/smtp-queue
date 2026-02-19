@@ -57,9 +57,16 @@ func New(cfg *config.RedisConfig, maxAge time.Duration, maxFail int) (*Queue, er
 		return nil, fmt.Errorf("连接 Redis 失败: %w", err)
 	}
 
+	// 确保 key prefix 包含 hash tag，兼容 Redis Cluster（所有 key 落在同一 slot）
+	prefix := cfg.KeyPrefix
+	if !strings.Contains(prefix, "{") {
+		clean := strings.TrimSuffix(prefix, ":")
+		prefix = "{" + clean + "}:"
+	}
+
 	return &Queue{
 		client:  client,
-		prefix:  cfg.KeyPrefix,
+		prefix:  prefix,
 		maxAge:  maxAge,
 		maxFail: maxFail,
 	}, nil

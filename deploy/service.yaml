@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mail-relay
+  namespace: messaging-system
+  labels:
+    app: mail-relay
+spec:
+  type: ClusterIP
+  selector:
+    app: mail-relay
+  ports:
+    - name: smtp
+      port: 2525
+      targetPort: 2525
+      protocol: TCP

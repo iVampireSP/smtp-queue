@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mail-relay
+  namespace: messaging-system
+  labels:
+    app: mail-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mail-relay
+  template:
+    metadata:
+      labels:
+        app: mail-relay
+    spec:
+      containers:
+        - name: mail-relay
+          image: ghcr.io/ivampiresp/smtp-queue:latest
+          imagePullPolicy: Always
+          ports:
+            - name: smtp
+              containerPort: 2525
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          startupProbe:
+            tcpSocket:
+              port: 2525
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: 2525
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 2525
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap:
+            name: mail-relay-config
+      terminationGracePeriodSeconds: 65
