@@ -1,0 +1,34 @@
+listen_addr: ":2525"
+banner: "SMTP Queue Server Ready"   # 自定义 SMTP 欢迎信息（220 后面的内容）
+
+queue_interval: 30      # 秒
+max_email_age: 72       # 小时
+max_fail_count: 5
+worker_concurrency: 5   # 每实例并发消费者数
+
+redis:
+  addrs:
+    - "localhost:6379"
+  # master_name: "mymaster"    # Sentinel 模式
+  password: ""
+  db: 0
+  key_prefix: "smtp-queue:"
+
+pool:
+  max_idle_per_server: 5      # 每个 SMTP 服务器最大空闲连接数
+  max_active_per_server: 10   # 每个 SMTP 服务器最大活跃连接数
+  max_idle_time: 300          # 空闲连接最大存活秒数
+  max_lifetime: 1800          # 连接最大生命周期秒数
+  max_messages_per_conn: 100  # 单连接最大发送邮件数
+  dial_timeout: 30            # 连接超时秒数
+
+smtp_servers:
+  - name: "mailhog"
+    host: "localhost"
+    port: 1025
+    username: ""
+    password: ""
+    from: "test@example.com"
+    encryption: "none"
+    weight: 10
+    enabled: true

@@ -2,20 +2,22 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ivampiresp/smtp-queue/config"
-	"github.com/ivampiresp/smtp-queue/db"
+	"github.com/ivampiresp/smtp-queue/queue"
 	"github.com/rs/zerolog/log"
 )
 
 // 服务器状态码
 const (
-	statusReady             = "220 SMTP Queue Server Ready"
+	statusReadyPrefix       = "220 "
 	statusOK                = "250 OK"
 	statusStartMail         = "250 Go ahead"
 	statusDataReady         = "354 Start mail input; end with <CRLF>.<CRLF>"
@@ -26,34 +28,50 @@ const (
 	statusBadSequence       = "503 Bad sequence of commands"
 )
 
+// 限制常量
+const (
+	maxConnections = 100             // 最大并发连接数
+	maxDataSize    = 10 << 20        // 最大邮件数据 10MB
+	maxRecipients  = 100             // 单封邮件最大收件人数
+	idleTimeout    = 5 * time.Minute // 空闲超时
+)
+
 // Server 是一个简单的SMTP服务器，它接收邮件并将其添加到发送队列中
 type Server struct {
-	DB     *db.DB
+	Queue  *queue.Queue
 	Config *config.Config
 
+	mu       sync.Mutex
 	listener net.Listener
+	connWg   sync.WaitGroup
+	connSem  chan struct{}
 }
 
 // New 创建新的SMTP服务器实例
-func New(database *db.DB, cfg *config.Config) *Server {
+func New(q *queue.Queue, cfg *config.Config) *Server {
 	return &Server{
-		DB:     database,
-		Config: cfg,
+		Queue:   q,
+		Config:  cfg,
+		connSem: make(chan struct{}, maxConnections),
 	}
 }
 
 // Start 启动SMTP服务器
 func (s *Server) Start() error {
 	var err error
-	s.listener, err = net.Listen("tcp", s.Config.ListenAddr)
+	listener, err := net.Listen("tcp", s.Config.ListenAddr)
 	if err != nil {
 		return err
 	}
 
+	s.mu.Lock()
+	s.listener = listener
+	s.mu.Unlock()
+
 	log.Info().Str("addr", s.Config.ListenAddr).Msg("SMTP服务器开始监听")
 
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
@@ -62,15 +80,49 @@ func (s *Server) Start() error {
 			continue
 		}
 
-		go s.handleConnection(conn)
+		// 并发连接数限制
+		select {
+		case s.connSem <- struct{}{}:
+		default:
+			log.Warn().Str("client", conn.RemoteAddr().String()).Msg("连接数已满，拒绝连接")
+			conn.Close()
+			continue
+		}
+
+		s.connWg.Add(1)
+		go func() {
+			defer s.connWg.Done()
+			defer func() { <-s.connSem }()
+			s.handleConnection(conn)
+		}()
 	}
 }
 
-// Stop 停止SMTP服务器
+// Stop 停止SMTP服务器并等待活跃连接排空
 func (s *Server) Stop() error {
-	if s.listener != nil {
-		return s.listener.Close()
+	s.mu.Lock()
+	listener := s.listener
+	s.mu.Unlock()
+
+	if listener != nil {
+		if err := listener.Close(); err != nil {
+			return err
+		}
 	}
+
+	// 等待活跃连接结束（带超时）
+	done := make(chan struct{})
+	go func() {
+		s.connWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		log.Warn().Msg("等待活跃 SMTP 连接排空超时")
+	}
+
 	return nil
 }
 
@@ -80,24 +132,26 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 	log.Info().Str("client", conn.RemoteAddr().String()).Msg("客户端连接")
 
-	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(5 * time.Minute))
-
 	// 创建会话
-	session := newSession(conn, s.DB, s.Config)
+	session := newSession(conn, s.Queue, s.Config)
 
 	// 发送欢迎消息
-	session.send(statusReady)
+	session.send(statusReadyPrefix + s.Config.Banner)
 
-	// 处理会话
+	// 处理会话，每次命令后重置空闲超时
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20) // 最大行 1MB（base64 附件）
+
+	conn.SetDeadline(time.Now().Add(idleTimeout))
 	for scanner.Scan() {
+		// 每次收到数据后重置空闲超时
+		conn.SetDeadline(time.Now().Add(idleTimeout))
+
 		if err := session.handleCommand(scanner.Text()); err != nil {
 			log.Error().Err(err).Msg("处理命令时出错")
 			break
 		}
 
-		// 如果会话已关闭则退出
 		if session.quit {
 			break
 		}
@@ -112,25 +166,26 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 // smtpSession 表示一个SMTP会话
 type smtpSession struct {
-	conn net.Conn
-	db   *db.DB
-	cfg  *config.Config
+	conn  net.Conn
+	queue *queue.Queue
+	cfg   *config.Config
 
 	// 会话状态
 	helo     string
 	mailFrom string
 	rcptTo   []string
 	data     []string
+	dataSize int
 	inData   bool
 	quit     bool
 }
 
 // 创建新的SMTP会话
-func newSession(conn net.Conn, database *db.DB, cfg *config.Config) *smtpSession {
+func newSession(conn net.Conn, q *queue.Queue, cfg *config.Config) *smtpSession {
 	return &smtpSession{
-		conn: conn,
-		db:   database,
-		cfg:  cfg,
+		conn:  conn,
+		queue: q,
+		cfg:   cfg,
 	}
 }
 
@@ -141,8 +196,6 @@ func (s *smtpSession) send(message string) {
 
 // 处理SMTP命令
 func (s *smtpSession) handleCommand(line string) error {
-	log.Debug().Str("line", line).Msg("收到命令")
-
 	if s.inData {
 		return s.handleData(line)
 	}
@@ -189,6 +242,15 @@ func (s *smtpSession) handleHelo(args string) error {
 	return nil
 }
 
+// extractAddress 从 SMTP 参数中提取邮件地址
+func extractAddress(raw string) string {
+	addr := strings.TrimSpace(raw)
+	addr = strings.TrimPrefix(addr, "<")
+	addr = strings.TrimSuffix(addr, ">")
+	addr = strings.TrimSpace(addr)
+	return strings.ToLower(addr)
+}
+
 // 处理MAIL FROM命令
 func (s *smtpSession) handleMail(args string) error {
 	if s.helo == "" {
@@ -201,9 +263,7 @@ func (s *smtpSession) handleMail(args string) error {
 		return nil
 	}
 
-	// 提取邮件地址
-	mailFrom := strings.ToLower(args[5:])
-	mailFrom = strings.Trim(mailFrom, "<>")
+	mailFrom := extractAddress(args[5:])
 	if mailFrom == "" {
 		s.send(statusSyntaxError)
 		return nil
@@ -226,9 +286,12 @@ func (s *smtpSession) handleRcpt(args string) error {
 		return nil
 	}
 
-	// 提取邮件地址
-	rcptTo := strings.ToLower(args[3:])
-	rcptTo = strings.Trim(rcptTo, "<>")
+	if len(s.rcptTo) >= maxRecipients {
+		s.send("452 Too many recipients")
+		return nil
+	}
+
+	rcptTo := extractAddress(args[3:])
 	if rcptTo == "" {
 		s.send(statusSyntaxError)
 		return nil
@@ -247,6 +310,7 @@ func (s *smtpSession) handleDataCommand() error {
 	}
 
 	s.inData = true
+	s.dataSize = 0
 	s.send(statusDataReady)
 	return nil
 }
@@ -257,10 +321,9 @@ func (s *smtpSession) handleData(line string) error {
 	if line == "." {
 		s.inData = false
 
-		// 处理邮件
 		if err := s.processEmail(); err != nil {
 			log.Error().Err(err).Msg("处理邮件时出错")
-			s.send(fmt.Sprintf("554 Transaction failed: %s", err.Error()))
+			s.send("554 Transaction failed")
 			return nil
 		}
 
@@ -273,6 +336,16 @@ func (s *smtpSession) handleData(line string) error {
 		line = line[1:]
 	}
 
+	// DATA 大小限制
+	s.dataSize += len(line) + 2 // +2 for \r\n
+	if s.dataSize > maxDataSize {
+		s.inData = false
+		s.data = nil
+		s.dataSize = 0
+		s.send("552 Too much mail data")
+		return nil
+	}
+
 	s.data = append(s.data, line)
 	return nil
 }
@@ -282,6 +355,7 @@ func (s *smtpSession) handleRset() error {
 	s.mailFrom = ""
 	s.rcptTo = nil
 	s.data = nil
+	s.dataSize = 0
 	s.inData = false
 
 	s.send(statusOK)
@@ -310,33 +384,31 @@ func (s *smtpSession) processEmail() error {
 		}
 	}
 
-	// 如果没有找到主题，使用默认主题
 	if subject == "" {
 		subject = "(无主题)"
 	}
 
-	// 客户端提供的发件人仅用于记录，SMTP发送时将使用配置的SMTP_FROM
 	clientFrom := s.mailFrom
-
-	// 确保有配置的SMTP_FROM
-	if s.cfg.SMTPFrom == "" {
-		log.Warn().Str("client_from", clientFrom).Msg("未配置SMTP_FROM，邮件可能无法发送")
-	} else {
-		log.Info().Str("client_from", clientFrom).Str("actual_from", s.cfg.SMTPFrom).Msg("使用配置的发件人替代客户端发件人")
-	}
 
 	// 保留原始邮件内容，包括所有邮件头和正文
 	originalContent := strings.Join(s.data, "\r\n")
 
-	_, err := s.db.QueueEmail(clientFrom, s.rcptTo, subject, originalContent)
+	_, err := s.queue.Enqueue(context.Background(), clientFrom, s.rcptTo, subject, originalContent)
 	if err != nil {
 		return fmt.Errorf("将邮件添加到队列时出错: %w", err)
 	}
+
+	log.Info().
+		Str("from", clientFrom).
+		Strs("to", s.rcptTo).
+		Str("subject", subject).
+		Msg("邮件已入队")
 
 	// 重置会话状态
 	s.mailFrom = ""
 	s.rcptTo = nil
 	s.data = nil
+	s.dataSize = 0
 
 	return nil
 }

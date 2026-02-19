@@ -1,80 +1,135 @@
 # SMTP Queue
 
-SMTP Queue 是一个简单的SMTP服务器，它接收邮件并将其添加到队列中，然后通过配置的真实SMTP服务器发送。
+SMTP Queue 是一个可横向扩展的 SMTP 中继队列服务，使用 Redis 存储邮件队列，支持多 SMTP 出站服务器和容灾切换。
 
 ## 特性
 
-- 提供无需认证的SMTP服务器接口
-- 将接收到的邮件保存到SQLite数据库
-- 定时发送队列中的邮件
-- 支持TLS连接
+- 提供无需认证的 SMTP 服务器接口
+- Redis 队列存储，支持多实例横向扩展
+- 多 SMTP 出站服务器，加权随机 + 故障转移
+- BRPOP 阻塞消费，天然防止重复发送
+- 支持 TLS / SSL / 明文 连接
 - 自动重试失败的邮件
-- 发送成功后自动删除邮件
-- 定期清理过期或多次失败的邮件
+- 邮件 TTL 自动过期清理
+- 多平台 Docker 镜像（amd64 / arm64）
 
 ## 安装
 
+### 从源码编译
+
 ```bash
-# 克隆项目
 git clone https://github.com/ivampiresp/smtp-queue.git
 cd smtp-queue
+go build -o smtp-queue .
+```
 
-# 安装依赖
-go mod download
+### Docker
 
-# 编译项目
-go build -o smtp-queue
+```bash
+docker pull ghcr.io/ivampiresp/smtp-queue:latest
+
+docker run -d \
+  -p 2525:2525 \
+  -v /path/to/config.yaml:/app/config.yaml \
+  ghcr.io/ivampiresp/smtp-queue:latest
 ```
 
 ## 配置
 
-项目使用.env文件进行配置，您可以复制 `.env.example` 文件并根据需要修改：
+复制示例配置并按需修改：
 
 ```bash
-cp .env.example .env
+cp config.yaml.example config.yaml
 ```
 
-配置选项：
+配置文件路径通过以下优先级确定：
+1. `-config` 命令行参数
+2. `CONFIG_PATH` 环境变量
+3. 默认 `config.yaml`
 
-- `LISTEN_ADDR`: SMTP服务器监听地址，例如:1025
-- `DB_PATH`: SQLite数据库文件路径
-- `QUEUE_INTERVAL`: 队列处理间隔（秒）
-- `MAX_EMAIL_AGE`: 邮件最大保留时间（小时）
-- `MAX_FAIL_COUNT`: 邮件最大失败尝试次数
-- `SMTP_HOST`: 真实SMTP服务器主机
-- `SMTP_PORT`: 真实SMTP服务器端口
-- `SMTP_USERNAME`: SMTP用户名
-- `SMTP_PASSWORD`: SMTP密码
-- `SMTP_FROM`: 发件人地址（覆盖客户端提供的地址）
-- `SMTP_ENCRYPTION`: SMTP加密方式，支持：none(无加密)、ssl、tls
+### 配置示例
+
+```yaml
+listen_addr: ":2525"
+
+queue_interval: 30      # 秒
+max_email_age: 72       # 小时
+max_fail_count: 5
+worker_concurrency: 5   # 每实例并发消费者数
+
+redis:
+  addrs:
+    - "localhost:6379"
+  # master_name: "mymaster"    # Sentinel 模式
+  password: ""
+  db: 0
+  key_prefix: "smtp-queue:"
+
+smtp_servers:
+  - name: "primary"
+    host: "smtp.example.com"
+    port: 587
+    username: "user@example.com"
+    password: "your_password"
+    from: "noreply@example.com"
+    encryption: "tls"
+    weight: 10
+    enabled: true
+
+  - name: "backup"
+    host: "smtp-backup.example.com"
+    port: 465
+    username: "user@example.com"
+    password: "your_password"
+    from: "noreply@example.com"
+    encryption: "ssl"
+    weight: 1
+    enabled: true
+```
+
+### 环境变量覆盖
+
+敏感字段支持环境变量覆盖：
+
+- `REDIS_PASSWORD` — 覆盖 `redis.password`
+- `SMTP_{NAME}_PASSWORD` — 覆盖对应 name 的 SMTP 服务器密码（NAME 大写）
+- `SMTP_{NAME}_USERNAME` — 覆盖对应 name 的 SMTP 服务器用户名（NAME 大写）
+
+例如配置中 `name: "primary"` 的服务器，可通过 `SMTP_PRIMARY_PASSWORD` 环境变量覆盖密码。
 
 ## 使用
 
 ```bash
-# 启动服务器
-./smtp-queue
+# 启动服务
+./smtp-queue -config config.yaml
+
+# 或使用环境变量指定配置
+CONFIG_PATH=/etc/smtp-queue/config.yaml ./smtp-queue
 ```
 
-客户端可以连接到配置的监听地址，无需认证即可发送邮件。服务器会将邮件存入队列，然后使用配置的SMTP服务器发送。成功发送后，邮件会自动从队列中删除。
+### 横向扩展
 
-## 数据库管理
+多个实例连接同一个 Redis 即可实现横向扩展。BRPOP 保证同一封邮件只会被一个实例消费。
 
-系统会自动管理队列：
+```bash
+# 实例 1
+./smtp-queue -config config.yaml
 
-- 成功发送的邮件会立即从数据库中删除
-- 失败次数超过`MAX_FAIL_COUNT`的邮件会被自动清理
-- 创建时间超过`MAX_EMAIL_AGE`小时的邮件会被自动清理
-- 清理任务每12小时自动执行一次
+# 实例 2（可在不同机器）
+./smtp-queue -config config.yaml
+```
+
+### 故障转移
+
+配置多个 SMTP 服务器后，每封邮件发送时会按权重随机选择主服务器，若主服务器失败则依次尝试备选服务器。
 
 ## 测试
 
-可以使用以下命令测试服务器：
-
 ```bash
-# 使用telnet测试
-telnet localhost 1025
+# 使用 telnet 测试
+telnet localhost 2525
 
-# SMTP命令示例
+# SMTP 命令示例
 HELO example.com
 MAIL FROM:<sender@example.com>
 RCPT TO:<recipient@example.com>
@@ -86,6 +141,25 @@ This is a test email.
 QUIT
 ```
 
+## Docker Compose 示例
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  smtp-queue:
+    image: ghcr.io/ivampiresp/smtp-queue:latest
+    ports:
+      - "2525:2525"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+    depends_on:
+      - redis
+```
+
 ## 许可证
 
-MIT 
+MIT

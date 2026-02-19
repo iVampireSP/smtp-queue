@@ -1,2 +1,5 @@
 smtp_queue.db
 .env
+.DS_Store
+smtp-queue
+config.yaml
